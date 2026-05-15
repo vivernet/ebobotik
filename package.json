@@ -1,20 +1,23 @@
 {
   "name": "ebobotik",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "description": "Telegram-бот на grammY и официальном SDK OpenAI.",
   "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/config.js && node --check src/openai-service.js && node --check src/telegram-bot.js && node --check src/index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "author": "vivernet",
   "license": "MIT",
-  "description": "",
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
-    "@grammyjs/parse-mode": "^1.10.0",
-    "axios": "^1.7.7",
-    "dotenv": "^16.4.5",
-    "grammy": "^1.30.0",
-    "openai": "^5.12.2"
+    "@grammyjs/runner": "^2.0.3",
+    "dotenv": "^17.4.2",
+    "grammy": "^1.42.0",
+    "openai": "^6.37.0"
   }
 }
