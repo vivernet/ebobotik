@@ -1,5 +1,6 @@
 import { Bot } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
+import { randomUUID } from "node:crypto";
 
 /**
  * @file Telegram-слой приложения на grammY.
@@ -21,6 +22,94 @@ import { autoRetry } from "@grammyjs/auto-retry";
  */
 function getMessageText(message) {
   return message?.text ?? message?.caption ?? "";
+}
+
+/**
+ * Возвращает сущности, относящиеся к тексту или подписи сообщения.
+ *
+ * @param {Context["message"]} message - Сообщение Telegram.
+ * @returns {Array<{ type: string, offset: number, length: number }>} Сущности сообщения.
+ */
+function getMessageEntities(message) {
+  return message?.entities ?? message?.caption_entities ?? [];
+}
+
+/**
+ * Проверяет, есть ли в сообщении явное упоминание текущего бота.
+ *
+ * @param {Context} ctx - Контекст grammY.
+ * @param {Context["message"]} message - Проверяемое сообщение.
+ * @returns {boolean} `true`, если бот был упомянут через `@username`.
+ */
+function isBotMentioned(ctx, message) {
+  const username = ctx.me?.username;
+  const text = getMessageText(message);
+
+  if (!username || !text) {
+    return false;
+  }
+
+  const expectedMention = `@${username}`.toLowerCase();
+
+  return getMessageEntities(message).some(
+    (entity) =>
+      entity.type === "mention" &&
+      text.slice(entity.offset, entity.offset + entity.length).toLowerCase() ===
+        expectedMention,
+  );
+}
+
+/**
+ * Убирает упоминание текущего бота из запроса, чтобы модель получала тот же
+ * текст, который пользователь написал бы боту в личном чате.
+ *
+ * @param {Context} ctx - Контекст grammY.
+ * @param {Context["message"]} message - Сообщение с упоминанием.
+ * @returns {string} Текст без упоминаний текущего бота.
+ */
+function removeBotMentions(ctx, message) {
+  const username = ctx.me?.username;
+  const text = getMessageText(message);
+
+  if (!username || !text) {
+    return text;
+  }
+
+  const expectedMention = `@${username}`.toLowerCase();
+  const mentions = getMessageEntities(message)
+    .filter(
+      (entity) =>
+        entity.type === "mention" &&
+        text.slice(entity.offset, entity.offset + entity.length).toLowerCase() ===
+          expectedMention,
+    )
+    .sort((left, right) => right.offset - left.offset);
+
+  return mentions
+    .reduce(
+      (result, entity) =>
+        result.slice(0, entity.offset) + result.slice(entity.offset + entity.length),
+      text,
+    )
+    .trim();
+}
+
+/**
+ * Добавляет текст исходного сообщения в контекст запроса, если пользователь
+ * ответил на него. Это работает и для обычных сообщений, и для guest-запросов.
+ *
+ * @param {string} requestText - Текст, адресованный боту.
+ * @param {Context["message"]} replyToMessage - Сообщение, на которое сделан реплай.
+ * @returns {string} Запрос для модели.
+ */
+function buildInputWithReplyContext(requestText, replyToMessage) {
+  const replyText = getMessageText(replyToMessage).trim();
+
+  if (!replyText) {
+    return requestText;
+  }
+
+  return `Контекст сообщения, на которое ответил пользователь:\n${replyText}\n\nЗапрос пользователя:\n${requestText}`;
 }
 
 /**
@@ -113,6 +202,21 @@ function isPrivateTextMessage(ctx) {
 }
 
 /**
+ * Проверяет упоминание бота в обычном групповом чате, куда бот уже добавлен.
+ * Для чатов, где бота нет, Telegram присылает отдельный `guest_message`.
+ *
+ * @param {Context} ctx - Контекст grammY.
+ * @returns {boolean} `true`, если бота упомянули в группе или супергруппе.
+ */
+function isGroupMention(ctx) {
+  return Boolean(
+    ctx.message &&
+      ["group", "supergroup"].includes(ctx.chat?.type) &&
+      isBotMentioned(ctx, ctx.message),
+  );
+}
+
+/**
  * Отправляет HTML-ответ и привязывает его к указанному сообщению.
  *
  * @param {Context} ctx - Контекст grammY.
@@ -125,6 +229,27 @@ async function replyWithGeneratedText(ctx, text, replyToMessageId, parseMode) {
   await ctx.reply(text, {
     reply_to_message_id: replyToMessageId,
     parse_mode: parseMode,
+  });
+}
+
+/**
+ * Отвечает на guest-запрос. В этом сценарии нельзя использовать обычный
+ * `sendMessage`: бот может не быть участником исходного чата.
+ *
+ * @param {Context} ctx - Контекст guest-обновления grammY.
+ * @param {string} text - Текст ответа.
+ * @param {string} parseMode - Режим форматирования Telegram.
+ * @returns {Promise<void>}
+ */
+async function answerGuestMessage(ctx, text, parseMode) {
+  await ctx.answerGuestQuery({
+    type: "article",
+    id: randomUUID(),
+    title: "Ответ",
+    input_message_content: {
+      message_text: text,
+      parse_mode: parseMode,
+    },
   });
 }
 
@@ -156,6 +281,41 @@ async function generateAndReply(options) {
     options.replyToMessageId,
     options.parseMode,
   );
+}
+
+/**
+ * Обрабатывает разовое обращение к гостевому боту из любого поддерживаемого чата.
+ *
+ * @param {Context} ctx - Контекст grammY.
+ * @param {Parameters<typeof createTelegramBot>[0]} settings - Настройки приложения.
+ * @param {{ generateReply(message: string): Promise<string> }} openAIService - Сервис генерации.
+ * @returns {Promise<void>}
+ */
+async function handleGuestMessage(ctx, settings, openAIService) {
+  const message = ctx.guestMessage;
+  const incomingText = getMessageText(message);
+
+  if (
+    !incomingText ||
+    hasBannedFragment(incomingText, settings.moderation.bannedTextFragments)
+  ) {
+    return;
+  }
+
+  const input = trimInput(
+    buildInputWithReplyContext(
+      removeBotMentions(ctx, message),
+      message.reply_to_message,
+    ),
+    settings.app.maxInputLength,
+  );
+
+  if (!input) {
+    return;
+  }
+
+  const generatedText = await openAIService.generateReply(input);
+  await answerGuestMessage(ctx, generatedText, settings.telegram.parseMode);
 }
 
 /**
@@ -229,13 +389,36 @@ export function createTelegramBot(settings, openAIService) {
     if (isPrivateTextMessage(ctx)) {
       await generateAndReply({
         ctx,
-        sourceText: incomingText,
+        sourceText: buildInputWithReplyContext(
+          incomingText,
+          ctx.message.reply_to_message,
+        ),
+        replyToMessageId: ctx.message.message_id,
+        openAIService,
+        parseMode: settings.telegram.parseMode,
+        maxInputLength: settings.app.maxInputLength,
+      });
+
+      return;
+    }
+
+    if (isGroupMention(ctx)) {
+      await generateAndReply({
+        ctx,
+        sourceText: buildInputWithReplyContext(
+          removeBotMentions(ctx, ctx.message),
+          ctx.message.reply_to_message,
+        ),
         replyToMessageId: ctx.message.message_id,
         openAIService,
         parseMode: settings.telegram.parseMode,
         maxInputLength: settings.app.maxInputLength,
       });
     }
+  });
+
+  bot.on("guest_message", async (ctx) => {
+    await handleGuestMessage(ctx, settings, openAIService);
   });
 
   return bot;

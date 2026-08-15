@@ -219,7 +219,12 @@ export const config = Object.freeze({
       min: 1,
       max: 50,
     }),
-    allowedUpdates: stringListEnv("TELEGRAM_ALLOWED_UPDATES", ["message"]),
+    allowedUpdates: Array.from(
+      new Set([
+        ...stringListEnv("TELEGRAM_ALLOWED_UPDATES", ["message"]),
+        "guest_message",
+      ]),
+    ),
     replyTrigger: stringEnv("REPLY_TRIGGER", "!"),
     parseMode: stringEnv("TELEGRAM_PARSE_MODE", "HTML"),
     protectedUserIds: idSetEnv("PROTECTED_USER_IDS", [1087968824]),
